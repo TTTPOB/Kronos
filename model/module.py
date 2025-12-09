@@ -87,10 +87,17 @@ class BinarySphericalQuantizer(nn.Module):
                            torch.tensor(-1, dtype=z.dtype, device=z.device))
         return z + (zhat - z).detach()
 
-    def forward(self, z):
+    def forward(self, z, collect_metrics=True):
         # if self.input_format == 'bchw':
         #     z = rearrange(z, 'b c h w -> b h w c')
         zq = self.quantize(z)
+
+        q_scale = 1. / (self.embed_dim ** 0.5) if self.l2_norm else 1.
+
+        zq = zq * q_scale
+
+        if not collect_metrics:
+            return zq, zq.new_zeros(()), {}
 
         indices = self.codes_to_indexes(zq.detach())
         group_indices = self.codes_to_group_indexes(zq.detach())
@@ -98,8 +105,6 @@ class BinarySphericalQuantizer(nn.Module):
             used_codes = torch.unique(indices, return_counts=False)
         else:
             used_codes = None
-
-        q_scale = 1. / (self.embed_dim ** 0.5) if self.l2_norm else 1.
 
         if self.soft_entropy:
             persample_entropy, cb_entropy, avg_prob = self.soft_entropy_loss(z)
@@ -109,8 +114,6 @@ class BinarySphericalQuantizer(nn.Module):
             persample_entropy = self.get_hard_per_sample_entropy(zb_by_sample)
             cb_entropy = codebook_entropy(zq, self.basis, self.embed_dim)
             entropy_penalty = self.gamma0 * persample_entropy - self.gamma * cb_entropy
-
-        zq = zq * q_scale
 
         # commit loss
         commit_loss = self.beta * torch.mean(((zq.detach() - z) ** 2).sum(dim=-1))
@@ -239,9 +242,9 @@ class BSQuantizer(nn.Module):
         )
         return (bits * indices).sum(-1)
 
-    def forward(self, z, half=False):
+    def forward(self, z, half=False, collect_metrics=True):
         z = F.normalize(z, dim=-1)
-        quantized, bsq_loss, metrics = self.bsq(z)
+        quantized, bsq_loss, metrics = self.bsq(z, collect_metrics=collect_metrics)
         if half:
             q_pre = quantized[:, :, :self.s1_bits]
             q_post = quantized[:, :, self.s1_bits:]
@@ -309,33 +312,6 @@ class RotaryPositionalEmbedding(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
 
-def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, training=True) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype).to(query.device)
-
-    if is_causal:
-        assert attn_mask is None
-        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(query.device)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-        attn_bias.to(query.dtype)
-
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-
-    if attn_mask is not None:
-        attn_mask_bias = torch.zeros_like(attn_weight)
-        if attn_mask.dtype == torch.bool:
-            attn_mask_bias.masked_fill_(attn_mask, float("-inf"))
-        else:
-            attn_mask_bias += attn_mask
-        attn_weight += attn_mask_bias
-
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=training)
-    return attn_weight @ value
-
-
 class MultiHeadAttentionWithRoPE(nn.Module):
     def __init__(self, d_model, n_heads, attn_dropout_p=0.0, resid_dropout_p=0.0):
         super().__init__()
@@ -366,12 +342,11 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         else:
             attn_mask = None
 
-        attn_output = scaled_dot_product_attention(
+        attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            dropout_p=self.attn_dropout_p,
-            is_causal=True,
-            training=self.training
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=True
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
@@ -411,12 +386,11 @@ class MultiHeadCrossAttentionWithRoPE(nn.Module):
 
         is_causal_flag = self.training
 
-        attn_output = scaled_dot_product_attention(
+        attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            dropout_p=self.attn_dropout_p,
-            is_causal=is_causal_flag,
-            training=self.training
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=is_causal_flag
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
@@ -440,9 +414,24 @@ class HierarchicalEmbedding(nn.Module):
         nn.init.normal_(self.emb_s1.weight, mean=0, std=d_model ** -0.5)
         nn.init.normal_(self.emb_s2.weight, mean=0, std=d_model ** -0.5)
 
+    def split_token(self, token_ids: torch.Tensor, s2_bits: int):
+        """Inputs:
+            token_ids (torch.Tensor): Composite token IDs of shape [batch_size, seq_len] or [N], each in range [0, 2^(s1_bits + s2_bits) - 1].
+            s2_bits (int): Number of low bits used for the fine token (s2).
+        """
+        assert isinstance(s2_bits, int) and s2_bits > 0, "s2_bits must be a positive integer"
+
+        t = token_ids.long()
+        mask = (1 << s2_bits) - 1
+        s2_ids = t & mask           # extract low bits
+        s1_ids = t >> s2_bits       # extract high bits
+        return s1_ids, s2_ids
+
     def forward(self, token_ids):
         """Inputs:
-        token_ids: [batch_size, seq_len] token ID
+        token_ids:
+            - tuple or list: (s1_ids, s2_ids), each of shape [batch_size, seq_len], or
+            - torch.Tensor: composite token IDs of shape [batch_size, seq_len], which will be split into (s1_ids, s2_ids) internally.
         Output: [batch_size, seq_len, d_model]
         """
         if isinstance(token_ids, tuple) or isinstance(token_ids, list):
