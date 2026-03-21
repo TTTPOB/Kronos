@@ -386,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
 
 
 def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
-    with torch.no_grad():
+    with torch.inference_mode():
         x = torch.clip(x, -clip, clip)
 
         device = x.device
@@ -493,6 +493,8 @@ class KronosPredictor:
 
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
+        self.tokenizer.eval()
+        self.model.eval()
 
     def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
 
