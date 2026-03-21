@@ -488,6 +488,7 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
             z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(original_batch_size, sample_count, z.size(1), z.size(2))
         z = z[:, :, -pred_len:, :]
+        z = z.float()
 
         if return_samples:
             return z.cpu().numpy()
