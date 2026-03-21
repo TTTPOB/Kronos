@@ -1,3 +1,4 @@
+import contextlib
 import sys
 
 import numpy as np
@@ -385,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_samples=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_samples=False, autocast_dtype=None):
     with torch.inference_mode():
         x = torch.clip(x, -clip, clip)
 
@@ -395,88 +396,96 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         x_stamp = x_stamp.to(device)
         y_stamp = y_stamp.to(device)
 
-        x_token = tokenizer.encode(x, half=True)
-
-        if sample_count > 1:
-            x_token = [
-                token.unsqueeze(1)
-                .repeat(1, sample_count, 1)
-                .reshape(-1, token.size(1))
-                .contiguous()
-                for token in x_token
-            ]
-        initial_seq_len = x.size(1)
-        batch_size = x_token[0].size(0)
-        total_seq_len = initial_seq_len + pred_len
-        full_stamp = torch.cat([x_stamp, y_stamp], dim=1)
-        if sample_count > 1:
-            full_stamp = (
-                full_stamp.unsqueeze(1)
-                .repeat(1, sample_count, 1, 1)
-                .reshape(-1, full_stamp.size(1), full_stamp.size(2))
-                .contiguous()
+        autocast_context = contextlib.nullcontext()
+        if autocast_dtype is not None and x.device.type == "cuda":
+            autocast_context = torch.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
             )
 
-        generated_pre = x_token[0].new_empty(batch_size, pred_len)
-        generated_post = x_token[1].new_empty(batch_size, pred_len)
+        with autocast_context:
+            x_token = tokenizer.encode(x, half=True)
 
-        pre_buffer = x_token[0].new_zeros(batch_size, max_context)
-        post_buffer = x_token[1].new_zeros(batch_size, max_context)
-        buffer_len = min(initial_seq_len, max_context)
-        if buffer_len > 0:
-            start_idx = max(0, initial_seq_len - max_context)
-            pre_buffer[:, :buffer_len] = x_token[0][:, start_idx:start_idx + buffer_len]
-            post_buffer[:, :buffer_len] = x_token[1][:, start_idx:start_idx + buffer_len]
-
-        if verbose:
-            ran = trange
-        else:
-            ran = range
-        for i in ran(pred_len):
-            current_seq_len = initial_seq_len + i
-            window_len = min(current_seq_len, max_context)
-
-            if current_seq_len <= max_context:
-                input_tokens = [
-                    pre_buffer[:, :window_len],
-                    post_buffer[:, :window_len]
+            if sample_count > 1:
+                x_token = [
+                    token.unsqueeze(1)
+                    .repeat(1, sample_count, 1)
+                    .reshape(-1, token.size(1))
+                    .contiguous()
+                    for token in x_token
                 ]
+            initial_seq_len = x.size(1)
+            batch_size = x_token[0].size(0)
+            total_seq_len = initial_seq_len + pred_len
+            full_stamp = torch.cat([x_stamp, y_stamp], dim=1)
+            if sample_count > 1:
+                full_stamp = (
+                    full_stamp.unsqueeze(1)
+                    .repeat(1, sample_count, 1, 1)
+                    .reshape(-1, full_stamp.size(1), full_stamp.size(2))
+                    .contiguous()
+                )
+
+            generated_pre = x_token[0].new_empty(batch_size, pred_len)
+            generated_post = x_token[1].new_empty(batch_size, pred_len)
+
+            pre_buffer = x_token[0].new_zeros(batch_size, max_context)
+            post_buffer = x_token[1].new_zeros(batch_size, max_context)
+            buffer_len = min(initial_seq_len, max_context)
+            if buffer_len > 0:
+                start_idx = max(0, initial_seq_len - max_context)
+                pre_buffer[:, :buffer_len] = x_token[0][:, start_idx:start_idx + buffer_len]
+                post_buffer[:, :buffer_len] = x_token[1][:, start_idx:start_idx + buffer_len]
+
+            if verbose:
+                ran = trange
             else:
-                input_tokens = [pre_buffer, post_buffer]
+                ran = range
+            for i in ran(pred_len):
+                current_seq_len = initial_seq_len + i
+                window_len = min(current_seq_len, max_context)
 
-            context_end = current_seq_len
-            context_start = max(0, context_end - max_context)
-            current_stamp = full_stamp[:, context_start:context_end, :].contiguous()
+                if current_seq_len <= max_context:
+                    input_tokens = [
+                        pre_buffer[:, :window_len],
+                        post_buffer[:, :window_len]
+                    ]
+                else:
+                    input_tokens = [pre_buffer, post_buffer]
 
-            s1_logits, context = model.decode_s1(input_tokens[0], input_tokens[1], current_stamp)
-            s1_logits = s1_logits[:, -1, :]
-            sample_pre = sample_from_logits(s1_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+                context_end = current_seq_len
+                context_start = max(0, context_end - max_context)
+                current_stamp = full_stamp[:, context_start:context_end, :].contiguous()
 
-            s2_logits = model.decode_s2(context, sample_pre)
-            s2_logits = s2_logits[:, -1, :]
-            sample_post = sample_from_logits(s2_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+                s1_logits, context = model.decode_s1(input_tokens[0], input_tokens[1], current_stamp)
+                s1_logits = s1_logits[:, -1, :]
+                sample_pre = sample_from_logits(s1_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
 
-            generated_pre[:, i] = sample_pre.squeeze(-1)
-            generated_post[:, i] = sample_post.squeeze(-1)
+                s2_logits = model.decode_s2(context, sample_pre)
+                s2_logits = s2_logits[:, -1, :]
+                sample_post = sample_from_logits(s2_logits, temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
 
-            if current_seq_len < max_context:
-                pre_buffer[:, current_seq_len] = sample_pre.squeeze(-1)
-                post_buffer[:, current_seq_len] = sample_post.squeeze(-1)
-            else:
-                pre_buffer.copy_(torch.roll(pre_buffer, shifts=-1, dims=1))
-                post_buffer.copy_(torch.roll(post_buffer, shifts=-1, dims=1))
-                pre_buffer[:, -1] = sample_pre.squeeze(-1)
-                post_buffer[:, -1] = sample_post.squeeze(-1)
+                generated_pre[:, i] = sample_pre.squeeze(-1)
+                generated_post[:, i] = sample_post.squeeze(-1)
 
-        full_pre = torch.cat([x_token[0], generated_pre], dim=1)
-        full_post = torch.cat([x_token[1], generated_post], dim=1)
+                if current_seq_len < max_context:
+                    pre_buffer[:, current_seq_len] = sample_pre.squeeze(-1)
+                    post_buffer[:, current_seq_len] = sample_post.squeeze(-1)
+                else:
+                    pre_buffer.copy_(torch.roll(pre_buffer, shifts=-1, dims=1))
+                    post_buffer.copy_(torch.roll(post_buffer, shifts=-1, dims=1))
+                    pre_buffer[:, -1] = sample_pre.squeeze(-1)
+                    post_buffer[:, -1] = sample_post.squeeze(-1)
 
-        context_start = max(0, total_seq_len - max_context)
-        input_tokens = [
-            full_pre[:, context_start:total_seq_len].contiguous(),
-            full_post[:, context_start:total_seq_len].contiguous()
-        ]
-        z = tokenizer.decode(input_tokens, half=True)
+            full_pre = torch.cat([x_token[0], generated_pre], dim=1)
+            full_post = torch.cat([x_token[1], generated_post], dim=1)
+
+            context_start = max(0, total_seq_len - max_context)
+            input_tokens = [
+                full_pre[:, context_start:total_seq_len].contiguous(),
+                full_post[:, context_start:total_seq_len].contiguous()
+            ]
+            z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(original_batch_size, sample_count, z.size(1), z.size(2))
         z = z[:, :, -pred_len:, :]
 
@@ -499,7 +508,7 @@ def calc_time_stamps(x_timestamp):
 
 class KronosPredictor:
 
-    def __init__(self, model, tokenizer, device="cuda:0", max_context=512, clip=5):
+    def __init__(self, model, tokenizer, device="cuda:0", max_context=512, clip=5, autocast_dtype="auto"):
         self.tokenizer = tokenizer
         self.model = model
         self.max_context = max_context
@@ -508,12 +517,28 @@ class KronosPredictor:
         self.vol_col = 'volume'
         self.amt_vol = 'amount'
         self.time_cols = ['minute', 'hour', 'weekday', 'day', 'month']
-        self.device = device
+        self.device = torch.device(device)
+        self.autocast_dtype = self._resolve_autocast_dtype(autocast_dtype)
 
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
         self.tokenizer.eval()
         self.model.eval()
+
+    def _resolve_autocast_dtype(self, autocast_dtype):
+        if autocast_dtype in (None, "none"):
+            return None
+        if self.device.type != "cuda":
+            return None
+        if autocast_dtype == "auto":
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            return torch.float16
+        if autocast_dtype == "bfloat16":
+            return torch.bfloat16
+        if autocast_dtype == "float16":
+            return torch.float16
+        raise ValueError(f"Unsupported autocast dtype: {autocast_dtype}")
 
     def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_samples=False):
 
@@ -522,7 +547,7 @@ class KronosPredictor:
         y_stamp_tensor = torch.from_numpy(np.asarray(y_stamp, dtype=np.float32)).to(self.device)
 
         preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose, return_samples=return_samples)
+                                          self.clip, T, top_k, top_p, sample_count, verbose, return_samples=return_samples, autocast_dtype=self.autocast_dtype)
         return preds
 
     def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True, return_samples=False):
