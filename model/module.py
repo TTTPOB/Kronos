@@ -1,10 +1,17 @@
 import math
+from dataclasses import dataclass
 
 from einops import rearrange, reduce
 import torch
 import torch.nn as nn
 from torch.autograd import Function
 import torch.nn.functional as F
+
+
+@dataclass
+class AttentionCache:
+    k: torch.Tensor
+    v: torch.Tensor
 
 
 class DifferentiableEntropyFunction(Function):
@@ -291,7 +298,7 @@ class RotaryPositionalEmbedding(nn.Module):
         self.sin_cached = None
 
     def _update_cos_sin_cache(self, x, seq_len):
-        if seq_len != self.seq_len_cached:
+        if self.seq_len_cached is None or seq_len > self.seq_len_cached:
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.einsum('i,j->ij', t, self.inv_freq)
@@ -299,6 +306,17 @@ class RotaryPositionalEmbedding(nn.Module):
             self.cos_cached = emb.cos()[None, None, :, :]
             self.sin_cached = emb.sin()[None, None, :, :]
         return self.cos_cached, self.sin_cached
+
+    def apply_rotary(self, x, positions=None):
+        if positions is None:
+            positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.long)
+        else:
+            positions = torch.as_tensor(positions, device=x.device, dtype=torch.long).view(-1)
+        max_position = int(positions.max().item()) + 1 if positions.numel() > 0 else 0
+        cos, sin = self._update_cos_sin_cache(x, max_position)
+        cos = cos.index_select(2, positions)
+        sin = sin.index_select(2, positions)
+        return (x * cos) + (self._rotate_half(x) * sin)
 
     def forward(self, q, k):
         cos, sin = self._update_cos_sin_cache(q, q.shape[-2])
@@ -327,16 +345,44 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         self.attn_dropout_p = attn_dropout_p
         self.resid_dropout = nn.Dropout(resid_dropout_p)
 
-    def forward(self, x, key_padding_mask=None):
+    def forward(
+        self,
+        x,
+        key_padding_mask=None,
+        positions=None,
+        kv_cache=None,
+        use_cache=False,
+        max_cache_len=None,
+    ):
         batch_size, seq_len, _ = x.shape
 
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q, k = self.rotary(q, k)
+        cached_k = k
+        cached_v = v
+        if kv_cache is not None:
+            cached_k = torch.cat([kv_cache.k, cached_k], dim=2)
+            cached_v = torch.cat([kv_cache.v, cached_v], dim=2)
+        if max_cache_len is not None and cached_k.size(2) > max_cache_len:
+            cached_k = cached_k[:, :, -max_cache_len:, :].contiguous()
+            cached_v = cached_v[:, :, -max_cache_len:, :].contiguous()
+
+        if kv_cache is not None:
+            key_positions = torch.arange(cached_k.size(2), device=x.device, dtype=torch.long)
+            query_positions = key_positions[-seq_len:]
+            q = self.rotary.apply_rotary(q, query_positions)
+            k = self.rotary.apply_rotary(cached_k, key_positions)
+            v = cached_v
+        else:
+            q = self.rotary.apply_rotary(q, positions)
+            k = self.rotary.apply_rotary(cached_k, positions)
+            v = cached_v
 
         if key_padding_mask is not None:
+            if kv_cache is not None:
+                raise ValueError("key_padding_mask is not supported together with kv_cache")
             attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
             attn_mask = attn_mask.expand(-1, self.n_heads, seq_len, -1)  # [batch, n_heads, q_len, k_len]
         else:
@@ -346,11 +392,14 @@ class MultiHeadAttentionWithRoPE(nn.Module):
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout_p if self.training else 0.0,
-            is_causal=True
+            is_causal=kv_cache is None,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        return self.resid_dropout(self.out_proj(attn_output))
+        attn_output = self.resid_dropout(self.out_proj(attn_output))
+        if use_cache:
+            return attn_output, AttentionCache(k=cached_k, v=cached_v)
+        return attn_output
 
 
 class MultiHeadCrossAttentionWithRoPE(nn.Module):
@@ -470,16 +519,36 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ffn = FeedForward(d_model, ff_dim, ffn_dropout_p)
 
-    def forward(self, x, key_padding_mask=None):
+    def forward(
+        self,
+        x,
+        key_padding_mask=None,
+        positions=None,
+        kv_cache=None,
+        use_cache=False,
+        max_cache_len=None,
+    ):
         residual = x
         x = self.norm1(x)
-        attn_out = self.self_attn(x, key_padding_mask=key_padding_mask)
+        if use_cache:
+            attn_out, next_cache = self.self_attn(
+                x,
+                key_padding_mask=key_padding_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                use_cache=True,
+                max_cache_len=max_cache_len,
+            )
+        else:
+            attn_out = self.self_attn(x, key_padding_mask=key_padding_mask)
         x = residual + attn_out
 
         residual = x
         x = self.norm2(x)
         ffn_out = self.ffn(x)
         x = residual + ffn_out
+        if use_cache:
+            return x, next_cache
         return x
 
 

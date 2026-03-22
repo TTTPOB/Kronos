@@ -236,6 +236,13 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
 
+    def _embed_tokens(self, s1_ids, s2_ids, stamp=None):
+        x = self.embedding([s1_ids, s2_ids])
+        if stamp is not None:
+            time_embedding = self.time_emb(stamp)
+            x = x + time_embedding
+        return self.token_drop(x)
+
     def forward(self, s1_ids, s2_ids, stamp=None, padding_mask=None, use_teacher_forcing=False, s1_targets=None):
         """
         Args:
@@ -251,11 +258,7 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
                 - s1 logits: Logits for s1 token predictions. Shape: [batch_size, seq_len, s1_vocab_size]
                 - s2_logits: Logits for s2 token predictions, conditioned on s1. Shape: [batch_size, seq_len, s2_vocab_size]
         """
-        x = self.embedding([s1_ids, s2_ids])
-        if stamp is not None:
-            time_embedding = self.time_emb(stamp)
-            x = x + time_embedding
-        x = self.token_drop(x)
+        x = self._embed_tokens(s1_ids, s2_ids, stamp=stamp)
 
         for layer in self.transformer:
             x = layer(x, key_padding_mask=padding_mask)
@@ -293,11 +296,7 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
                 - s1 logits: Logits for s1 token predictions. Shape: [batch_size, seq_len, s1_vocab_size]
                 - context: Context representation from the Transformer. Shape: [batch_size, seq_len, d_model]
         """
-        x = self.embedding([s1_ids, s2_ids])
-        if stamp is not None:
-            time_embedding = self.time_emb(stamp)
-            x = x + time_embedding
-        x = self.token_drop(x)
+        x = self._embed_tokens(s1_ids, s2_ids, stamp=stamp)
 
         for layer in self.transformer:
             x = layer(x, key_padding_mask=padding_mask)
@@ -306,6 +305,67 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
 
         s1_logits = self.head(x)
         return s1_logits, x
+
+    def prefill_for_generation(
+        self,
+        s1_ids,
+        s2_ids,
+        stamp=None,
+        padding_mask=None,
+        *,
+        max_cache_len,
+        positions=None,
+    ):
+        x = self._embed_tokens(s1_ids, s2_ids, stamp=stamp)
+        if positions is None:
+            positions = torch.arange(x.size(1), device=x.device, dtype=torch.long)
+        layer_caches = []
+        for layer in self.transformer:
+            x, layer_cache = layer(
+                x,
+                key_padding_mask=padding_mask,
+                positions=positions,
+                use_cache=True,
+                max_cache_len=max_cache_len,
+            )
+            layer_caches.append(layer_cache)
+
+        x = self.norm(x)
+        if max_cache_len is not None and x.size(1) > max_cache_len:
+            x = x[:, -max_cache_len:, :].contiguous()
+        s1_logits = self.head(x[:, -1:, :])[:, -1, :]
+        return s1_logits, x, layer_caches
+
+    def decode_next_for_generation(
+        self,
+        s1_ids,
+        s2_ids,
+        layer_caches,
+        stamp=None,
+        padding_mask=None,
+        *,
+        position,
+        max_cache_len,
+    ):
+        if s1_ids.size(1) != 1 or s2_ids.size(1) != 1:
+            raise ValueError("decode_next_for_generation expects one token at a time")
+        x = self._embed_tokens(s1_ids, s2_ids, stamp=stamp)
+        positions = torch.as_tensor(position, device=x.device, dtype=torch.long).view(-1)
+        next_caches = []
+        for layer, layer_cache in zip(self.transformer, layer_caches):
+            x, next_cache = layer(
+                x,
+                key_padding_mask=padding_mask,
+                positions=positions,
+                kv_cache=layer_cache,
+                use_cache=True,
+                max_cache_len=max_cache_len,
+            )
+            next_caches.append(next_cache)
+
+        x = self.norm(x)
+        s1_logits = self.head(x)[:, -1, :]
+        return s1_logits, x, next_caches
 
     def decode_s2(self, context, s1_ids, padding_mask=None):
         """
@@ -386,7 +446,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_samples=False, autocast_dtype=None):
+def _auto_regressive_inference_no_cache(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_samples=False, autocast_dtype=None):
     with torch.inference_mode():
         x = torch.clip(x, -clip, clip)
 
@@ -497,6 +557,169 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         return preds.cpu().numpy()
 
 
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_samples=False, autocast_dtype=None):
+    if x.size(1) + pred_len > max_context:
+        return _auto_regressive_inference_no_cache(
+            tokenizer=tokenizer,
+            model=model,
+            x=x,
+            x_stamp=x_stamp,
+            y_stamp=y_stamp,
+            max_context=max_context,
+            pred_len=pred_len,
+            clip=clip,
+            T=T,
+            top_k=top_k,
+            top_p=top_p,
+            sample_count=sample_count,
+            verbose=verbose,
+            return_samples=return_samples,
+            autocast_dtype=autocast_dtype,
+        )
+    with torch.inference_mode():
+        x = torch.clip(x, -clip, clip)
+
+        device = x.device
+        original_batch_size = x.size(0)
+        x = x.to(device)
+        x_stamp = x_stamp.to(device)
+        y_stamp = y_stamp.to(device)
+
+        autocast_context = contextlib.nullcontext()
+        if autocast_dtype is not None and x.device.type == "cuda":
+            autocast_context = torch.autocast(
+                device_type="cuda",
+                dtype=autocast_dtype,
+            )
+
+        with autocast_context:
+            full_prompt_tokens = tokenizer.encode(x, half=True)
+            prompt_pre = full_prompt_tokens[0][:, -max_context:].contiguous()
+            prompt_post = full_prompt_tokens[1][:, -max_context:].contiguous()
+            prompt_x_stamp = x_stamp[:, -prompt_pre.size(1):, :].contiguous()
+            prompt_len = prompt_pre.size(1)
+
+            next_s1_logits, hidden_cache, layer_caches = model.prefill_for_generation(
+                prompt_pre,
+                prompt_post,
+                prompt_x_stamp,
+                max_cache_len=max_context,
+                positions=torch.arange(prompt_len, device=device, dtype=torch.long),
+            )
+
+            if sample_count > 1:
+                next_s1_logits = (
+                    next_s1_logits.unsqueeze(1)
+                    .repeat(1, sample_count, 1)
+                    .reshape(-1, next_s1_logits.size(-1))
+                    .contiguous()
+                )
+                hidden_cache = (
+                    hidden_cache.unsqueeze(1)
+                    .repeat(1, sample_count, 1, 1)
+                    .reshape(-1, hidden_cache.size(1), hidden_cache.size(2))
+                    .contiguous()
+                )
+                prompt_pre = (
+                    prompt_pre.unsqueeze(1)
+                    .repeat(1, sample_count, 1)
+                    .reshape(-1, prompt_pre.size(1))
+                    .contiguous()
+                )
+                prompt_post = (
+                    prompt_post.unsqueeze(1)
+                    .repeat(1, sample_count, 1)
+                    .reshape(-1, prompt_post.size(1))
+                    .contiguous()
+                )
+                y_stamp = (
+                    y_stamp.unsqueeze(1)
+                    .repeat(1, sample_count, 1, 1)
+                    .reshape(-1, y_stamp.size(1), y_stamp.size(2))
+                    .contiguous()
+                )
+                expanded_caches = []
+                for layer_cache in layer_caches:
+                    expanded_caches.append(
+                        AttentionCache(
+                            k=layer_cache.k.unsqueeze(1)
+                            .repeat(1, sample_count, 1, 1, 1)
+                            .reshape(-1, layer_cache.k.size(1), layer_cache.k.size(2), layer_cache.k.size(3))
+                            .contiguous(),
+                            v=layer_cache.v.unsqueeze(1)
+                            .repeat(1, sample_count, 1, 1, 1)
+                            .reshape(-1, layer_cache.v.size(1), layer_cache.v.size(2), layer_cache.v.size(3))
+                            .contiguous(),
+                        )
+                    )
+                layer_caches = expanded_caches
+
+            batch_size = prompt_pre.size(0)
+            generated_pre = prompt_pre.new_empty(batch_size, pred_len)
+            generated_post = prompt_post.new_empty(batch_size, pred_len)
+
+            if verbose:
+                ran = trange
+            else:
+                ran = range
+
+            for i in ran(pred_len):
+                sample_pre = sample_from_logits(
+                    next_s1_logits,
+                    temperature=T,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_logits=True,
+                )
+
+                s2_logits = model.decode_s2(hidden_cache, sample_pre)
+                s2_logits = s2_logits[:, -1, :]
+                sample_post = sample_from_logits(
+                    s2_logits,
+                    temperature=T,
+                    top_k=top_k,
+                    top_p=top_p,
+                    sample_logits=True,
+                )
+
+                generated_pre[:, i] = sample_pre.squeeze(-1)
+                generated_post[:, i] = sample_post.squeeze(-1)
+
+                if i + 1 < pred_len:
+                    next_s1_logits, new_hidden, layer_caches = model.decode_next_for_generation(
+                        sample_pre,
+                        sample_post,
+                        layer_caches,
+                        stamp=y_stamp[:, i:i + 1, :],
+                        position=[prompt_len],
+                        max_cache_len=max_context,
+                    )
+                    if hidden_cache.size(1) < max_context:
+                        hidden_cache = torch.cat([hidden_cache, new_hidden], dim=1)
+                    else:
+                        hidden_cache = torch.cat([hidden_cache[:, 1:, :], new_hidden], dim=1)
+
+            full_pre = torch.cat([prompt_pre, generated_pre], dim=1)
+            full_post = torch.cat([prompt_post, generated_post], dim=1)
+
+            total_seq_len = full_pre.size(1)
+            context_start = max(0, total_seq_len - max_context)
+            input_tokens = [
+                full_pre[:, context_start:total_seq_len].contiguous(),
+                full_post[:, context_start:total_seq_len].contiguous(),
+            ]
+            z = tokenizer.decode(input_tokens, half=True)
+        z = z.reshape(original_batch_size, sample_count, z.size(1), z.size(2))
+        z = z[:, :, -pred_len:, :]
+        z = z.float()
+
+        if return_samples:
+            return z.cpu().numpy()
+
+        preds = torch.mean(z, dim=1)
+        return preds.cpu().numpy()
+
+
 def calc_time_stamps(x_timestamp):
     time_df = pd.DataFrame()
     time_df['minute'] = x_timestamp.dt.minute
@@ -509,7 +732,7 @@ def calc_time_stamps(x_timestamp):
 
 class KronosPredictor:
 
-    def __init__(self, model, tokenizer, device="cuda:0", max_context=512, clip=5, autocast_dtype="auto"):
+    def __init__(self, model, tokenizer, device="cuda:0", max_context=512, clip=5, autocast_dtype="auto", use_kv_cache=False):
         self.tokenizer = tokenizer
         self.model = model
         self.max_context = max_context
@@ -520,6 +743,7 @@ class KronosPredictor:
         self.time_cols = ['minute', 'hour', 'weekday', 'day', 'month']
         self.device = torch.device(device)
         self.autocast_dtype = self._resolve_autocast_dtype(autocast_dtype)
+        self.use_kv_cache = use_kv_cache
 
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
@@ -547,8 +771,9 @@ class KronosPredictor:
         x_stamp_tensor = torch.from_numpy(np.asarray(x_stamp, dtype=np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.asarray(y_stamp, dtype=np.float32)).to(self.device)
 
-        preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose, return_samples=return_samples, autocast_dtype=self.autocast_dtype)
+        inference_fn = auto_regressive_inference if self.use_kv_cache else _auto_regressive_inference_no_cache
+        preds = inference_fn(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
+                             self.clip, T, top_k, top_p, sample_count, verbose, return_samples=return_samples, autocast_dtype=self.autocast_dtype)
         return preds
 
     def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True, return_samples=False):
