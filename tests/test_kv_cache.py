@@ -99,6 +99,26 @@ def test_prefill_and_incremental_decode_match_full_decode():
     torch.testing.assert_close(new_hidden, full_next_hidden[:, -1:, :], rtol=0.0, atol=1e-6)
 
 
+@pytest.mark.parametrize("prime_dep_layer", [False, True])
+def test_decode_s2_single_step_preserves_query_length(prime_dep_layer):
+    torch.manual_seed(456)
+    _, model = _build_tiny_model_pair()
+
+    prompt_pre = torch.randint(0, 4, (1, 3))
+    prompt_post = torch.randint(0, 4, (1, 3))
+    _, prompt_stamp, _ = _build_inference_inputs(batch_size=1, seq_len=3, pred_len=1)
+    prompt_stamp = prompt_stamp[:, :3, :]
+
+    if prime_dep_layer:
+        model(prompt_pre, prompt_post, prompt_stamp)
+
+    _, context = model.decode_s1(prompt_pre, prompt_post, prompt_stamp)
+    sampled_pre = torch.randint(0, 4, (1, 1))
+    s2_logits = model.decode_s2(context, sampled_pre)
+
+    assert s2_logits.shape == (1, 1, model.head.vocab_s2)
+
+
 @pytest.mark.parametrize(
     ("seq_len", "pred_len", "max_context"),
     [

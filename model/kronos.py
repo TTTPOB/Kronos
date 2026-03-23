@@ -384,7 +384,15 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
             torch.Tensor: s2 logits. Shape: [batch_size, seq_len, s2_vocab_size]
         """
         sibling_embed = self.embedding.emb_s1(s1_ids)
-        x2 = self.dep_layer(context, sibling_embed, key_padding_mask=padding_mask)
+        key_positions = torch.arange(context.size(1), device=context.device, dtype=torch.long)
+        query_positions = key_positions[-s1_ids.size(1):]
+        x2 = self.dep_layer(
+            context,
+            sibling_embed,
+            key_padding_mask=padding_mask,
+            query_positions=query_positions,
+            key_positions=key_positions,
+        )
         return self.head.cond_forward(x2)
 
 

@@ -318,11 +318,10 @@ class RotaryPositionalEmbedding(nn.Module):
         sin = sin.index_select(2, positions)
         return (x * cos) + (self._rotate_half(x) * sin)
 
-    def forward(self, q, k):
-        cos, sin = self._update_cos_sin_cache(q, q.shape[-2])
+    def forward(self, q, k, q_positions=None, k_positions=None):
         return (
-            (q * cos) + (self._rotate_half(q) * sin),
-            (k * cos) + (self._rotate_half(k) * sin),
+            self.apply_rotary(q, q_positions),
+            self.apply_rotary(k, k_positions),
         )
 
     def _rotate_half(self, x):
@@ -417,7 +416,15 @@ class MultiHeadCrossAttentionWithRoPE(nn.Module):
         self.attn_dropout_p = attn_dropout_p
         self.resid_dropout = nn.Dropout(resid_dropout)
 
-    def forward(self, query, key, value, key_padding_mask=None):
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        key_padding_mask=None,
+        query_positions=None,
+        key_positions=None,
+    ):
         batch_size, q_len, _ = query.shape
         _, seq_len, _ = key.shape
 
@@ -425,7 +432,14 @@ class MultiHeadCrossAttentionWithRoPE(nn.Module):
         k = self.k_proj(key).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(value).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q, k = self.rotary(q, k)
+        if key_positions is None:
+            key_positions = torch.arange(seq_len, device=query.device, dtype=torch.long)
+        if query_positions is None:
+            if q_len > seq_len:
+                raise ValueError("query length cannot exceed key length without explicit query positions")
+            query_positions = key_positions[-q_len:]
+
+        q, k = self.rotary(q, k, q_positions=query_positions, k_positions=key_positions)
 
         if key_padding_mask is not None:
             attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
@@ -498,7 +512,14 @@ class DependencyAwareLayer(nn.Module):
         self.cross_attn = MultiHeadCrossAttentionWithRoPE(d_model, n_heads, attn_dropout_p, resid_dropout)
         self.norm = RMSNorm(d_model)
 
-    def forward(self, hidden_states, sibling_embed, key_padding_mask=None):
+    def forward(
+        self,
+        hidden_states,
+        sibling_embed,
+        key_padding_mask=None,
+        query_positions=None,
+        key_positions=None,
+    ):
         """hidden_states: [batch, seq_len, d_model]
         sibling_embed: Embedding from another subtoken
         """
@@ -506,9 +527,11 @@ class DependencyAwareLayer(nn.Module):
             query=sibling_embed,
             key=hidden_states,
             value=hidden_states,
-            key_padding_mask=key_padding_mask
+            key_padding_mask=key_padding_mask,
+            query_positions=query_positions,
+            key_positions=key_positions,
         )
-        return self.norm(hidden_states + attn_out)
+        return self.norm(sibling_embed + attn_out)
 
 
 class TransformerBlock(nn.Module):
